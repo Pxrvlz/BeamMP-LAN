@@ -149,6 +149,10 @@ impl RelayServer {
         while !self.stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    // Windows: accepted sockets inherit the listener's non-blocking
+                    // mode (Linux: they don't). Our client threads use blocking IO,
+                    // so force blocking here or every read fails immediately.
+                    let _ = stream.set_nonblocking(false);
                     let this = self.clone();
                     let stop_flag = self.stop.clone();
                     std::thread::spawn(move || {
