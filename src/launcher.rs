@@ -70,7 +70,7 @@ fn detect_game_windows() -> Option<GameInstall> {
     // 1. HKCU\Software\BeamNG\BeamNG.drive : rootpath / userpath_override
     let mut game_dir: Option<PathBuf> = None;
     let mut user_override: Option<PathBuf> = None;
-    if let Ok((key, _)) = hkcu.open_subkey("Software\\BeamNG\\BeamNG.drive") {
+    if let Ok(key) = hkcu.open_subkey("Software\\BeamNG\\BeamNG.drive") {
         if let Ok(rp) = key.get_value::<String, _>("rootpath") {
             game_dir = Some(PathBuf::from(&rp));
         }
