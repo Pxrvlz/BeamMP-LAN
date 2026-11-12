@@ -44,6 +44,12 @@ pub struct AppConfig {
     pub auto_refresh_secs: u64,
     /// Start the launcher core automatically.
     pub auto_start_core: bool,
+    /// Prefer the UDP beacon over TCP scanning (both always run; beacon first).
+    pub use_beacon: bool,
+    /// Player nickname for local identity.
+    pub nickname: String,
+    /// Relay Mode: host with the embedded server instead of BeamMP-Server (experimental).
+    pub relay_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +70,9 @@ impl Default for AppConfig {
             server_binary_override: String::new(),
             auto_refresh_secs: 5,
             auto_start_core: true,
+            use_beacon: true,
+            nickname: String::new(),
+            relay_mode: false,
         }
     }
 }
@@ -128,6 +137,8 @@ pub enum AppEvent {
     DownloadError { what: String, error: String },
     /// Game install detected (or not).
     GameDetected(Option<crate::launcher::GameInstall>),
+    /// UDP beacon seek finished (runs alongside the TCP scan).
+    BeaconDone(Vec<crate::beacon::BeaconInfo>),
 }
 
 /// Runtime state for the host page (per instance).
@@ -206,6 +217,21 @@ pub struct AppState {
     pub server_binary: Option<PathBuf>,
     pub downloading_server: bool,
 
+    // identity (nickname + machine id, no accounts)
+    pub identity: crate::identity::Identity,
+    /// Host-side role table (accounts.json) for the selected instance dir.
+    pub accounts: crate::identity::Accounts,
+
+    // UDP beacon
+    /// Live announcer while any of our servers is running.
+    pub announcer: Option<Arc<crate::beacon::Announcer>>,
+    pub beacons: Vec<crate::beacon::BeaconInfo>,
+    pub beacon_scanning: bool,
+
+    // relay mode (embedded server)
+    pub relay: Option<Arc<crate::relay::RelayServer>>,
+    pub relay_events: Vec<String>,
+    /// Host page choice: relay mode vs BeamMP-Server binary (persisted in cfg.relay_mode).
     // ui misc
     pub toasts: Vec<(String, std::time::Instant)>,
     pub event_tx: Sender<AppEvent>,
@@ -230,6 +256,22 @@ impl AppState {
             runtimes.insert(inst.id.clone(), InstanceRuntime::default());
         }
 
+        // local identity: nickname from config, persisted per machine
+        let id_dir = crate::identity::identity_dir(&dir);
+        let identity = crate::identity::Identity::load_or_create(
+            &id_dir,
+            if cfg.nickname.is_empty() {
+                "Player"
+            } else {
+                &cfg.nickname
+            },
+        )
+        .unwrap_or_else(|_| crate::identity::Identity {
+            nickname: "Player".into(),
+            machine_id: "0000000000000000".into(),
+        });
+        let accounts = crate::identity::Accounts::load(&dir);
+
         Self {
             page: Page::Servers,
             interfaces: Vec::new(),
@@ -244,6 +286,13 @@ impl AppState {
             core_logs: Vec::new(),
             server_binary: None,
             downloading_server: false,
+            identity,
+            accounts,
+            announcer: None,
+            beacons: Vec::new(),
+            beacon_scanning: false,
+            relay: None,
+            relay_events: Vec::new(),
             toasts: Vec::new(),
             event_tx,
             event_rx,
@@ -282,6 +331,16 @@ impl AppState {
             let found = crate::discovery::scan_lan(&cfg, &progress_cb);
             let _ = tx_done.send(AppEvent::ScanDone(found));
         });
+        // UDP beacon seek runs in parallel — instant results on broadcast-friendly
+        // networks while the TCP scan probes every host.
+        if self.cfg.use_beacon && !self.beacon_scanning {
+            self.beacon_scanning = true;
+            let tx_b = self.event_tx.clone();
+            std::thread::spawn(move || {
+                let found = crate::beacon::seek(crate::beacon::SEEK_WINDOW);
+                let _ = tx_b.send(AppEvent::BeaconDone(found));
+            });
+        }
     }
 
     /// Refresh manual servers' info in the background.
@@ -307,10 +366,40 @@ impl AppState {
         });
     }
 
-    /// All servers currently visible (discovered + manual, deduped by addr).
+    /// All servers currently visible (discovered + manual + beacon, deduped by addr).
     pub fn all_servers(&self) -> Vec<ServerInfo> {
         let mut out: Vec<ServerInfo> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        // Beacon hits first: they're instant and carry the join essentials.
+        for b in &self.beacons {
+            let info = ServerInfo {
+                addr: b.endpoint(),
+                name: b.name.clone(),
+                map: b.map.clone(),
+                players: b.players,
+                maxplayers: b.maxplayers,
+                version: if b.relay {
+                    "LAN relay".into()
+                } else {
+                    String::new()
+                },
+                clientversion: String::new(),
+                tags: "LAN".into(),
+                guests: true,
+                desc: if b.relay {
+                    "Hosted by BeamMP-LAN Relay Mode (no internet required)".into()
+                } else {
+                    String::new()
+                },
+                modlist: String::new(),
+                modstotal: b.requires.len() as u32,
+                modstotalsize: 0,
+                playerslist: Vec::new(),
+            };
+            if seen.insert(info.addr.clone()) {
+                out.push(info);
+            }
+        }
         for d in &self.discovered {
             if seen.insert(d.info.addr.clone()) {
                 out.push(d.info.clone());
@@ -423,6 +512,182 @@ impl AppState {
         }
         let dir = data_dir().join("server-bin");
         find_binary_in(&dir)
+    }
+
+    /// Start the embedded relay server (Relay Mode) for the given instance.
+    /// Fully offline: local auth, no BeamMP-Server binary, no keymaster.
+    pub fn start_relay(&mut self, idx: usize) {
+        if self.relay.is_some() {
+            self.toast("Relay Mode is already running".to_string());
+            return;
+        }
+        let Some(inst) = self.instances.get(idx).cloned() else {
+            return;
+        };
+        let dir = inst.dir.clone();
+        let relay = crate::relay::RelayServer::new(inst.config.clone(), dir);
+        // First-ever host on this data dir becomes Owner automatically.
+        self.accounts.ensure_owner(&self.identity);
+        let _ = self.accounts.save(&data_dir());
+        match relay.start() {
+            Ok(port) => {
+                self.relay_events
+                    .push(format!("Relay Mode listening on port {port}"));
+                self.relay = Some(relay);
+                self.toast(format!("Relay Mode started on port {port} — fully offline"));
+                self.start_announcer();
+            }
+            Err(e) => {
+                self.toast(format!("Relay Mode failed to start: {e}"));
+            }
+        }
+    }
+
+    /// Stop the relay server.
+    pub fn stop_relay(&mut self) {
+        if let Some(r) = self.relay.take() {
+            r.stop();
+            self.relay_events.push("Relay Mode stopped".into());
+        }
+        self.maybe_stop_announcer();
+    }
+
+    /// Start (or update) the UDP beacon announcer with the currently-running server.
+    pub fn start_announcer(&mut self) {
+        let announcer = match &self.announcer {
+            Some(a) => a.clone(),
+            None => {
+                let a = crate::beacon::Announcer::start();
+                self.announcer = Some(a.clone());
+                a
+            }
+        };
+        let (id, name, port, map, players, maxplayers, relay, requires): (
+            String,
+            String,
+            u16,
+            String,
+            u32,
+            u32,
+            bool,
+            Vec<String>,
+        ) = if let Some(r) = &self.relay {
+            let stats = r.stats();
+            (
+                self.identity.machine_id[..8].to_string(),
+                r.config.name.clone(),
+                r.config.port,
+                r.config.map.clone(),
+                stats.clients as u32,
+                r.config.max_players,
+                true,
+                Vec::new(),
+            )
+        } else {
+            // find a running instance
+            let running = self
+                .instances
+                .iter()
+                .find(|i| {
+                    self.runtimes
+                        .get(&i.id)
+                        .is_some_and(|rt| rt.state == RunState::Running)
+                })
+                .cloned();
+            match running {
+                Some(inst) => {
+                    let players = self
+                        .runtimes
+                        .get(&inst.id)
+                        .map(|rt| rt.players.len() as u32)
+                        .unwrap_or(0);
+                    let requires: Vec<String> = crate::mod_manager::list_mods(
+                        &inst.client_mods_dir(),
+                        crate::mod_manager::ModSide::Client,
+                    )
+                    .into_iter()
+                    .filter(|m| m.enabled)
+                    .map(|m| m.file_name)
+                    .collect();
+                    (
+                        self.identity.machine_id[..8].to_string(),
+                        inst.config.name.clone(),
+                        inst.config.port,
+                        inst.config.map.clone(),
+                        players,
+                        inst.config.max_players,
+                        false,
+                        requires,
+                    )
+                }
+                None => return, // nothing to announce
+            }
+        };
+        announcer.update(crate::beacon::BeaconInfo {
+            id,
+            name,
+            port,
+            map,
+            players,
+            maxplayers,
+            relay,
+            requires,
+            from_ip: String::new(),
+        });
+    }
+
+    /// Stop announcing when nothing is running anymore.
+    pub fn maybe_stop_announcer(&mut self) {
+        let any_running = self.relay.is_some()
+            || self
+                .runtimes
+                .values()
+                .any(|rt| rt.state == RunState::Running);
+        if !any_running {
+            if let Some(a) = self.announcer.take() {
+                a.stop();
+            }
+        }
+    }
+
+    /// Poll the relay for events/stats (called from the UI loop).
+    pub fn pump_relay(&mut self) {
+        let Some(relay) = self.relay.clone() else {
+            return;
+        };
+        for ev in relay.drain_events() {
+            use crate::relay::RelayEvent::*;
+            match ev {
+                Started { port } => {
+                    self.relay_events.push(format!("relay started on :{port}"));
+                }
+                Stopped => self.relay_events.push("relay stopped".into()),
+                ClientJoined { id, nickname } => {
+                    self.relay_events
+                        .push(format!("{nickname} joined (id {id})"));
+                    self.start_announcer(); // refresh player count in the beacon
+                }
+                ClientLeft {
+                    id,
+                    nickname,
+                    reason,
+                } => {
+                    self.relay_events
+                        .push(format!("{nickname} left ({reason}, id {id})"));
+                    self.start_announcer();
+                }
+                Chat { from, text } => {
+                    self.relay_events.push(format!("[chat] {from}: {text}"));
+                }
+                Log(l) => {
+                    self.relay_events.push(l);
+                    if self.relay_events.len() > 500 {
+                        let drop = self.relay_events.len() - 500;
+                        self.relay_events.drain(..drop);
+                    }
+                }
+            }
+        }
     }
 }
 

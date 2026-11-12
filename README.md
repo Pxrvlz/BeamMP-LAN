@@ -29,16 +29,32 @@ toolchain for local play:
 
 | Page | What it does |
 | --- | --- |
-| **SERVERS** | Discovers BeamMP servers on every connected network by speaking the native BeamMP info protocol (`'I'` packet on TCP 30814). No internet involved. One-click join, favorites, manual `IP:port` entries. |
-| **HOST** | Full BeamMP-Server instance manager: download the official server binary, create instances, edit `ServerConfig.toml` with a friendly UI, live console, start/stop/restart, delete. |
-| **MODS** | Manages each instance's `Resources/Client` (mods pushed to players) and `Resources/Server` (Lua plugins): install from `.zip`, enable/disable (`.zip.disabled`), SHA-256 hashes, protected-mod awareness via `mods.json`. |
+| **SERVERS** | Discovers BeamMP servers on every connected network — instantly via **UDP LAN beacon** (hosts announce on :30816), with the TCP subnet scan (`'I'` packet on :30814) as fallback. No internet involved. One-click join, favorites, manual `IP:port` entries. |
+| **HOST** | Two ways to host: **Relay Mode** (embedded server — fully offline, local identities, no AuthKey, experimental) or **BeamMP-Server instances** (full compatibility): download the official binary, create instances, edit `ServerConfig.toml` with a friendly UI, live console, start/stop/restart. One-click **CobaltEssentials** plugin install. |
+| **MODS** | Manages each instance's `Resources/Client` (mods pushed to players) and `Resources/Server` (Lua plugins): install from `.zip`, enable/disable (`.zip.disabled`), SHA-256 hashes, protected-mod awareness via `mods.json`. Relay Mode serves the same folders. |
 | **LAUNCHER** | Finds your BeamNG.drive install (registry / Steam / Linux paths), installs or updates the BeamMP mod into `mods/multiplayer/beammp.zip`, launches the game — and runs an **embedded launcher-core** that the in-game multiplayer UI connects to. |
-| **SETTINGS** | Discovery tuning (interfaces, ports, auto-refresh), launcher-core port, server binary override, about. |
+| **SETTINGS** | **Player identity** (nickname + machine ID — the whole account system), host-side **roles editor** (Owner/Admin/Moderator/Player/Guest), discovery tuning (beacon toggle, interfaces, ports), launcher-core port, about. |
 
 The embedded launcher-core is the special sauce: it implements the BeamMP launcher's
 localhost protocol (`127.0.0.1:4444` core, `:4445` proxy relay, guest login, mod sync)
 so the **in-game server browser shows your LAN servers** and joining works exactly like
 with the official launcher — minus the internet dependency for the server list.
+
+### Offline capability — the honest matrix
+
+| Capability | Relay Mode | BeamMP-Server instance |
+| --- | --- | --- |
+| Discover servers | ✅ offline (beacon + scan) | ✅ offline (beacon + scan) |
+| Host a session | ✅ offline | ✅ offline (after one-time AuthKey fetch) |
+| Join a session | ✅ offline | ✅ offline (client auth is server-side) |
+| Serve client mods | ✅ offline | ✅ offline |
+| Install BeamMP mod (first time) | ❌ needs internet once | ❌ needs internet once |
+| Full game-session fidelity | ⚠️ experimental | ✅ production |
+
+Relay Mode is labeled experimental for a reason: its handshake, identity, mod sync and
+frame fan-out are verified by scripted e2e tests, but real BeamNG clients exercise more
+protocol surface. For a full evening of racing, prefer a BeamMP-Server instance; for an
+air-gapped LAN, try Relay Mode and report what works.
 
 ## Screenshots
 
@@ -108,14 +124,14 @@ Protocol details were derived from the actual BeamMP sources and are documented 
 
 ```bash
 cargo build            # debug build
-cargo test             # 19 unit tests + protocol round-trips
-cargo test -- --ignored # + E2E test (needs scripts/e2e_protocol_test.py's fake server)
-cargo clippy           # lint
+cargo test             # 30 unit tests incl. beacon + relay e2e (loopback)
+cargo test -- --ignored # + wire-protocol E2E (needs scripts/e2e_protocol_test.py's fake server)
+cargo clippy --all-targets  # lint (CI runs this at -D warnings)
 cargo fmt              # format
 ```
 
-The E2E test drives a fake BeamMP server implementing the exact wire protocol:
-`python3 scripts/e2e_protocol_test.py` (repo root).
+The wire-protocol E2E drives a fake BeamMP server: `python3 scripts/e2e_protocol_test.py`
+(repo root). The beacon and relay e2e tests run self-contained on loopback.
 
 ## Project layout
 
@@ -124,28 +140,36 @@ src/
   main.rs           entry point + generated app icon
   theme.rs          BeamNG-style dark theme tokens & widgets
   net.rs            BeamMP wire protocol: info packets, ping, framing
-  discovery.rs      interface enumeration + LAN scanning
+  beacon.rs         UDP LAN beacon: announce / seek / reply discovery
+  identity.rs       local identity (nickname + machine ID) + role table
+  relay.rs          Relay Mode: embedded offline BeamMP-speaking server
+  discovery.rs      interface enumeration + TCP subnet scanning
   server_mgr.rs     server instances, ServerConfig.toml, process control
   mod_manager.rs    Resources/Client + Resources/Server mod management
   launcher.rs       game detection, BeamMP mod download, game launch
   launcher_core.rs  embedded launcher: 4444 core, proxy relay, guest login
   state.rs          app state, config persistence, event pump
   app.rs            the five UI pages
-docs/PLAN.md        design document & protocol research
+docs/PLAN.md        design document, protocol research, claim→implementation audit
 screenshots/        UI screenshots (generated via BEAMMP_LAN_SHOTS)
 ```
 
 ## Limitations & notes
 
-* **AuthKey / guest login still touch BeamMP's services** — that's how BeamMP-Server
-  itself authenticates clients and how the mod is distributed. The LAN *discovery*,
-  *server list* and *relay* never leave your network.
+* **BeamMP-Server instances**: the AuthKey (one-time, from
+  [keymaster.beammp.com](https://keymaster.beammp.com)) and client authentication still
+  touch BeamMP's services — that's baked into the stock server. Use **Relay Mode** when
+  you need the hosting side fully offline (experimental, see the matrix above).
+* **Relay Mode is experimental**: scripted e2e tests verify handshake, local auth, mod
+  sync and frame fan-out; real-game session fidelity (position/vehicle sync nuances)
+  is the next milestone. The UI labels it EXPERIMENTAL.
 * Server console *commands* (kick, say…) need a stdin pipe to the server process;
   the console view currently shows output only (see PLAN §6.2 — on the roadmap).
-* The relay covers TCP + UDP vehicle data with the launcher's compression rules;
-  exotic server plugins that change the protocol may need updates.
+* The launcher-core relay covers TCP + UDP vehicle data with the launcher's compression
+  rules; exotic server plugins that change the protocol may need updates.
 * BeamNG.drive itself is closed-source commercial software; this project is not
-  affiliated with BeamNG Srl. or BeamMP Ltd.
+  affiliated with BeamNG Srl. or BeamMP Ltd. CobaltEssentials is © its authors and is
+  downloaded on demand from its official releases, not bundled.
 
 ## License
 

@@ -46,7 +46,7 @@ impl Default for InstanceWizard {
             port: crate::net::DEFAULT_SERVER_PORT,
             map: "/levels/gridmap_v2/info.json".into(),
             max_players: 8,
-            max_cars: 2,
+            max_cars: 4,
             tags: "Freeroam,LAN".into(),
             auth_key: String::new(),
             open: false,
@@ -175,6 +175,7 @@ impl eframe::App for BeamMpLanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_events(ctx);
         self.state.interfaces = crate::discovery::list_interfaces();
+        self.state.pump_relay();
 
         // Auto-refresh: rescan periodically.
         if let Some(last) = self.state.last_scan {
@@ -261,12 +262,25 @@ impl BeamMpLanApp {
                         pill(ui, "LAUNCHER CORE OFFLINE", RED);
                     }
                     ui.add_space(8.0);
-                    if self.state.scanning {
+                    if self.state.relay.is_some() {
+                        pill(ui, "RELAY MODE ON", ACCENT);
+                        ui.add_space(8.0);
+                    }
+                    if self.state.scanning || self.state.beacon_scanning {
                         pill(ui, "SCANNING…", WARN);
                     } else {
+                        let n = self.state.all_servers().len();
                         pill(
                             ui,
-                            &format!("{} SERVERS FOUND", self.state.discovered.len()),
+                            &format!(
+                                "{n} SERVER{} FOUND{}",
+                                if n == 1 { "" } else { "S" },
+                                if self.state.beacons.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {} VIA BEACON", self.state.beacons.len())
+                                }
+                            ),
                             SELECTION,
                         );
                     }
@@ -372,6 +386,11 @@ impl BeamMpLanApp {
                 }
                 AppEvent::ScanProgress { scanned, total } => {
                     self.state.scan_progress = (scanned, total);
+                }
+                AppEvent::BeaconDone(found) => {
+                    self.state.beacon_scanning = false;
+                    self.state.beacons = found;
+                    self.state.push_server_list_to_core();
                 }
                 AppEvent::ServerInfo(info) => {
                     if let Some(existing) = self
@@ -484,7 +503,7 @@ impl BeamMpLanApp {
         );
         ui.label(
             RichText::new(
-                "BeamMP servers discovered on your networks — no internet needed. Works with Radmin VPN, ZeroTier, Tailscale and physical LANs.",
+                "BeamMP servers on your networks — discovered instantly via UDP beacon, with a TCP subnet scan as fallback. No internet needed. Works with Radmin VPN, ZeroTier, Tailscale and physical LANs.",
             )
             .color(TEXT_DIM)
             .small(),
@@ -698,12 +717,110 @@ impl BeamMpLanApp {
         );
         ui.label(
             RichText::new(
-                "BeamMP-Server instances managed by this app. Players on your LAN join them directly.",
+                "Two ways to host: Relay Mode (built-in, fully offline — no AuthKey, no internet) or a BeamMP-Server instance (full compatibility).",
             )
             .color(TEXT_DIM)
             .small(),
         );
         ui.add_space(10.0);
+
+        // Relay Mode card
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("RELAY MODE").color(ACCENT).strong());
+                if let Some(r) = &self.state.relay {
+                    let stats = r.stats();
+                    let max_players = r.config.max_players;
+                    pill(ui, "RUNNING", GREEN);
+                    pill(
+                        ui,
+                        &format!(
+                            "{}/{} PLAYERS · {} FRAMES RELAYED",
+                            stats.clients, max_players, stats.frames_relayed
+                        ),
+                        SELECTION,
+                    );
+                } else {
+                    pill(ui, "OFF", TEXT_DIM);
+                    pill(ui, "EXPERIMENTAL", WARN);
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "The embedded server: local identities (nickname + machine ID), zero config, no BeamMP-Server binary. \
+                     Best for air-gapped LANs. The first person to host on this machine becomes Owner automatically.",
+                )
+                .color(TEXT_DIM)
+                .small(),
+            );
+            ui.add_space(4.0);
+            let instance_for_relay =
+                self.state
+                    .selected_instance
+                    .or(if self.state.instances.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    });
+            ui.horizontal(|ui| {
+                if let Some(idx) = instance_for_relay {
+                    if self.state.relay.is_some() {
+                        if danger_button(ui, "STOP RELAY") {
+                            self.state.stop_relay();
+                        }
+                    } else if action_button(ui, "START RELAY") {
+                        self.state.start_relay(idx);
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Create an instance first (it holds the map/mods config).")
+                            .color(TEXT_DIM)
+                            .small(),
+                    );
+                }
+                if ghost_button(ui, "ANNOUNCE VIA BEACON") {
+                    self.state.start_announcer();
+                }
+            });
+            if !self.state.relay_events.is_empty() {
+                // players with roles + crown for the owner
+                let stats = self.state.relay.as_ref().map(|r| r.stats());
+                if let Some(st) = stats.filter(|s| s.clients > 0) {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("{} player(s) connected", st.clients))
+                            .color(TEXT)
+                            .small(),
+                    );
+                }
+                let owner_crown = self
+                    .state
+                    .accounts
+                    .role_of(&self.state.identity)
+                    .has_crown();
+                if owner_crown {
+                    ui.label(
+                        RichText::new("👑 you are the Owner of this host")
+                            .color(WARN)
+                            .small(),
+                    );
+                }
+                egui::CollapsingHeader::new(RichText::new("Relay log").color(TEXT_DIM).small())
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for l in self.state.relay_events.iter().rev().take(60).rev() {
+                                    ui.label(
+                                        RichText::new(l).monospace().size(11.0).color(TEXT_DIM),
+                                    );
+                                }
+                            });
+                    });
+            }
+        });
+        ui.add_space(8.0);
 
         // server binary availability
         ui.horizontal(|ui| {
@@ -719,7 +836,7 @@ impl BeamMpLanApp {
             } else if self.state.downloading_server {
                 pill(ui, "DOWNLOADING SERVER…", WARN);
             } else {
-                pill(ui, "NO SERVER BINARY", RED);
+                pill(ui, "NO SERVER BINARY", TEXT_DIM);
                 if action_button(ui, "DOWNLOAD BEAMMP-SERVER") {
                     self.state.downloading_server = true;
                     let tx = self.state.event_tx.clone();
@@ -741,6 +858,9 @@ impl BeamMpLanApp {
                         }
                     });
                 }
+            }
+            if self.state.downloading_server && ghost_button(ui, "INSTALL COBALTESSENTIALS") {
+                self.install_cobaltessentials();
             }
         });
         ui.add_space(6.0);
@@ -1489,8 +1609,134 @@ impl BeamMpLanApp {
         ui.heading(RichText::new("SETTINGS").strong().size(theme::HEADING_SIZE));
         ui.add_space(8.0);
 
+        // Identity card (nickname + machine id — the whole "account" system)
+        card(ui, |ui| {
+            ui.label(RichText::new("PLAYER IDENTITY").color(ACCENT).strong());
+            ui.label(
+                RichText::new(
+                    "No accounts, no passwords: you are a nickname plus this machine's ID. Hosts assign roles per machine ID.",
+                )
+                .color(TEXT_DIM)
+                .small(),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Nickname").color(TEXT_DIM));
+                let mut nick = self.state.identity.nickname.clone();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut nick)
+                        .desired_width(180.0)
+                        .hint_text("Player"),
+                );
+                if resp.changed() {
+                    self.state.identity.nickname = crate::identity::sanitize_nickname(&nick);
+                }
+                if resp.lost_focus() {
+                    let dir = crate::identity::identity_dir(&crate::state::data_dir());
+                    if self.state.identity.set_nickname(&dir, &nick).is_ok() {
+                        self.state.cfg.nickname = self.state.identity.nickname.clone();
+                        self.state.save_config();
+                        self.state.toast("Nickname saved".to_string());
+                    }
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "machine ID {}…",
+                        &self.state.identity.machine_id[..8]
+                    ))
+                    .color(TEXT_DIM)
+                    .small(),
+                );
+            });
+        });
+        ui.add_space(8.0);
+
+        // Roles card (host-side, accounts.json)
+        card(ui, |ui| {
+            ui.label(RichText::new("ROLES (THIS HOST)").color(ACCENT).strong());
+            ui.label(
+                RichText::new(
+                    "Machine IDs that joined this host. Edit roles for Relay Mode sessions; the first-ever host became Owner automatically.",
+                )
+                .color(TEXT_DIM)
+                .small(),
+            );
+            ui.add_space(4.0);
+            if self.state.accounts.entries.is_empty() {
+                ui.label(
+                    RichText::new("Nobody has hosted from this machine yet — start Relay Mode to become Owner.")
+                        .color(TEXT_DIM)
+                        .small(),
+                );
+            } else {
+                egui::Grid::new("roles")
+                    .num_columns(3)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("MACHINE").color(TEXT_DIM).small().strong());
+                        ui.label(RichText::new("NICKNAME").color(TEXT_DIM).small().strong());
+                        ui.label(RichText::new("ROLE").color(TEXT_DIM).small().strong());
+                        ui.end_row();
+                        let entries: Vec<(String, crate::identity::AccountEntry)> = self
+                            .state
+                            .accounts
+                            .entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        for (mid, entry) in entries {
+                            ui.label(
+                                RichText::new(format!("{}…", &mid[..8.min(mid.len())]))
+                                    .color(TEXT_DIM)
+                                    .small(),
+                            );
+                            ui.label(RichText::new(&entry.nickname).color(TEXT).small());
+                            let mut role = entry.role;
+                            egui::ComboBox::from_id_salt(format!("role_{mid}"))
+                                .selected_text(role.label())
+                                .show_ui(ui, |ui| {
+                                    for r in [
+                                        crate::identity::Role::Owner,
+                                        crate::identity::Role::Admin,
+                                        crate::identity::Role::Moderator,
+                                        crate::identity::Role::Player,
+                                        crate::identity::Role::Guest,
+                                    ] {
+                                        ui.selectable_value(&mut role, r, r.label());
+                                    }
+                                });
+                            if role != entry.role {
+                                self.state.accounts.entries.insert(
+                                    mid.clone(),
+                                    crate::identity::AccountEntry {
+                                        nickname: entry.nickname.clone(),
+                                        role,
+                                    },
+                                );
+                                let _ = self.state.accounts.save(&crate::state::data_dir());
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+        });
+        ui.add_space(8.0);
+
         card(ui, |ui| {
             ui.label(RichText::new("DISCOVERY").color(ACCENT).strong());
+            ui.horizontal(|ui| {
+                let mut use_beacon = self.state.cfg.use_beacon;
+                if ui
+                    .checkbox(
+                        &mut use_beacon,
+                        "UDP beacon discovery (instant, broadcast-based)",
+                    )
+                    .changed()
+                {
+                    self.state.cfg.use_beacon = use_beacon;
+                    self.state.save_config();
+                }
+            });
             egui::Grid::new("set_disc")
                 .num_columns(2)
                 .spacing([14.0, 6.0])
@@ -1615,6 +1861,123 @@ impl BeamMpLanApp {
             self.state.push_server_list_to_core();
             self.state.toast("Settings saved".to_string());
         }
+    }
+
+    /// Download CobaltEssentials (community BeamMP server plugin: admin commands,
+    /// permissions, vehicle management) into the selected instance's Server mods.
+    fn install_cobaltessentials(&mut self) {
+        let Some(idx) = self
+            .state
+            .selected_instance
+            .or(if self.state.instances.is_empty() {
+                None
+            } else {
+                Some(0)
+            })
+        else {
+            self.state
+                .toast("Create a server instance first.".to_string());
+            return;
+        };
+        let dir = self.state.instances[idx].server_mods_dir();
+        let tx = self.state.event_tx.clone();
+        self.state
+            .toast("Downloading CobaltEssentials v1.7.6 …".to_string());
+        std::thread::spawn(move || {
+            let url = "https://github.com/prestonelam2003/CobaltEssentials/releases/download/v1.7.6/CobaltEssentials.zip";
+            match ureq::get(url)
+                .timeout(std::time::Duration::from_secs(60))
+                .call()
+            {
+                Ok(resp) => {
+                    let mut buf = Vec::new();
+                    if std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).is_err()
+                        || buf.len() < 1000
+                    {
+                        let _ = tx.send(AppEvent::DownloadError {
+                            what: "CobaltEssentials".into(),
+                            error: "download failed or too small".into(),
+                        });
+                        return;
+                    }
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        let _ = tx.send(AppEvent::DownloadError {
+                            what: "CobaltEssentials".into(),
+                            error: e.to_string(),
+                        });
+                        return;
+                    }
+                    // The release zip contains the plugin zip(s); extract .zip members
+                    // into Resources/Server directly.
+                    let tmp = dir.join(".cobalt-download.zip");
+                    if std::fs::write(&tmp, &buf).is_err() {
+                        let _ = tx.send(AppEvent::DownloadError {
+                            what: "CobaltEssentials".into(),
+                            error: "cannot write temp file".into(),
+                        });
+                        return;
+                    }
+                    let file = match std::fs::File::open(&tmp) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::DownloadError {
+                                what: "CobaltEssentials".into(),
+                                error: e.to_string(),
+                            });
+                            return;
+                        }
+                    };
+                    let mut zip = match zip::ZipArchive::new(file) {
+                        Ok(z) => z,
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::DownloadError {
+                                what: "CobaltEssentials".into(),
+                                error: e.to_string(),
+                            });
+                            return;
+                        }
+                    };
+                    let mut installed = 0;
+                    for i in 0..zip.len() {
+                        let Ok(mut entry) = zip.by_index(i) else {
+                            continue;
+                        };
+                        if !entry.is_file() {
+                            continue;
+                        }
+                        let name = entry.name().to_string();
+                        if name.to_lowercase().ends_with(".zip") {
+                            let dest = dir.join(
+                                std::path::Path::new(&name)
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
+                            if let Ok(mut f) = std::fs::File::create(&dest) {
+                                if std::io::copy(&mut entry, &mut f).is_ok() {
+                                    installed += 1;
+                                }
+                            }
+                        }
+                    }
+                    let _ = std::fs::remove_file(&tmp);
+                    let _ = tx.send(AppEvent::DownloadDone {
+                        what: format!(
+                            "CobaltEssentials ({installed} plugin file{})",
+                            if installed == 1 { "" } else { "s" }
+                        ),
+                        path: dir.display().to_string(),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::DownloadError {
+                        what: "CobaltEssentials".into(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
     }
 }
 

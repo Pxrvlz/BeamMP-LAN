@@ -295,10 +295,114 @@ launcher `master`, mod `development`):
 | M5 | Launcher: game detect + mod download + launch | done |
 | M6 | Launcher-core: 4444 core, 4445 proxy, B-list injection, guest login, relay | done |
 | M7 | Settings page, packaging (CI), README, screenshots | done |
+| M8 | v0.2.0 "LAN Edition": UDP beacon, local identity + roles, Relay Mode, zero-config defaults | done |
 
-## 9. Licensing
+---
+
+# v0.2.0 — the "LAN Edition" upgrade
+
+The v0.2.0 release is a planned, honest response to the *BeamMP LAN Edition* concept
+document (a product pitch that promised full offline play, no accounts, no internet —
+but was never implemented). Instead of shipping marketing claims, every promise from
+that document was either **implemented verifiably**, **replaced with something that
+actually works**, or **documented as not-yet-true**. This section is the mapping.
+
+## 10. Claim → reality → implementation
+
+| # | LAN Edition claim | Reality check | What v0.2.0 does |
+| --- | --- | --- | --- |
+| 1 | "Hosts and clients discover each other via UDP LAN beacon" | Not in v0.1.0 (TCP subnet scan only, ~3 s) | **Implemented**: `beacon.rs` — hosts broadcast `BEAMMP_LAN1\|announce\|{json}` on UDP 30816 every 3 s; clients `seek` and get `reply` in < 1 s. TCP scan remains the fallback for broadcast-filtering networks. |
+| 2 | "No internet required" | Stock BeamMP-Server authenticates clients against auth.beammp.com — an internet dependency in the server itself | **Partially true, now honestly labeled**: *Relay Mode* (below) is fully offline. BeamMP-Server instances still need internet once for the AuthKey + client auth. The README has an explicit offline-capability matrix. |
+| 3 | "Fully self-contained, offline-capable fork of BeamMP rewritten in Rust" | BeamMP itself is AGPL C++ — forking it into this Rust app is neither needed nor done; only the wire protocols are shared | **Clarified**: BeamMP-LAN is a *companion*, not a fork. The only BeamMP code path replaced is the launcher (embedded core, v0.1.0). The server-side equivalent is Relay Mode. |
+| 4 | "Single ~9 MB executable" | True-ish goal; v0.1.0 release build was ~6–8 MB already | **Kept**: single static binary; CI measures and the README publishes the actual size per release. |
+| 5 | "Players authenticate with nickname + local hardware ID — no passwords" | Not in v0.1.0 | **Implemented**: `identity.rs` — nickname + 16-hex machine ID generated once, persisted in `identity.json`. The embedded core reports it to the game (`N` auth reply). |
+| 6 | "Optional role system: Owner/Admin/Moderator/Player (accounts.db)" | SQLite for 8 LAN players is overkill; "hardware ID" is just a random UUID (no actual hardware fingerprinting — that would be invasive) | **Implemented, simplified**: `accounts.json` (human-readable, diff-friendly) with the full role ladder, ordered `Guest < Player < Moderator < Admin < Owner`. First-ever host auto-becomes Owner. Role editor in Settings. "Hardware ID" honestly = per-machine random ID. |
+| 7 | "Guest access supported" | — | **Kept**: `AllowGuests` on stock servers; relay accepts any identity and assigns `Player <n>`. |
+| 8 | "In-game UI fully redesigned (7 screens: badges, scan buttons, teleport…)" | The BeamMP client mod is a closed-ish Lua/CEF codebase; shipping a redesigned in-game UI inside this app is not possible without forking the mod itself | **Replaced**: the app's own desktop UI (Servers/Host/Mods/Launcher/Settings) carries the LAN Edition features (beacon indicator, `[LAN]` tags, relay stats, roles, crown). The in-game browser gets the LAN server list via the core's `B` injection — same effect for discovery, without forking the mod. Documented as out-of-scope for the app. |
+| 9 | "Bring-your-own maps — drop the .zip into Resources/Client" | Already how BeamMP works | **Kept + improved**: Mods page manages it with enable/disable, hashing, and a file picker; relay serves the same folder. |
+| 10 | "Zero-config server: 8 players, 4 cars out of the box" | v0.1.0 defaults were MaxCars 1, tags "Freeroam" | **Implemented**: defaults now `MaxPlayers 8`, `MaxCars 4`, tags `Freeroam,LAN`; Relay Mode needs literally zero config (no AuthKey at all). |
+| 11 | "CobaltEssentials server plugin included" | Bundling third-party binaries has license + update problems | **Implemented as 1-click install**: Host page button downloads the verified official release (prestonelam2003/CobaltEssentials v1.7.6, 60 KB) and extracts the plugin zips into the selected instance's `Resources/Server`. |
+| 12 | "CEF keyboard focus fixed (chat)" | That's a BeamMP mod bug, fixed upstream | **Dropped**: not this app's code; upstream mod handles it. |
+
+## 11. Relay Mode — the fully-offline path (experimental)
+
+`relay.rs` embeds a BeamMP-speaking server in the app itself, removing the last hard
+internet dependency for hosting:
+
+```
+client                              BeamMP-LAN (Relay Mode)
+  │  TCP connect                           │
+  │  'C' ────────────────────────────────► │  identify
+  │  ◄frame► "VC2.3.2" ──────────────────► │  version  ──► framed "A"
+  │  ◄frame► "<machine_id>|<nickname>" ───► │  local auth (any key accepted;
+  │                                        │   identity from identity.rs)
+  │  ◄frame► "P1"                          │  client id assigned
+  │  ◄frame► "SR" ───────────────────────► │  mod list {"mods": {...}}
+  │  ◄frame► "f<mymod.zip>" ─────────────► │  mod served from Resources/Client
+  │  ◄frame► "Done"                        │  enter session
+  │  ◄──── frames fan out between all connected clients ────► │
+```
+
+* **Local trust model**: any auth key is accepted; the identity payload
+  `<machine_id>|<nickname>` is parsed when our own client side sends it. Unknown
+  clients get `Player <id>`.
+* **Mods**: the same `Resources/Client` folder as stock; `f<name>` file requests are
+  served with length-prefixed raw bytes (stock protocol), path-traversal-proof.
+* **Sessions**: every client's frames fan out to all others (no echo). Chat frames
+  surface in the Host page relay log.
+* **Why experimental**: the real BeamNG client exercises far more protocol surface
+  (position/vehicle sync details, ping keepalives, spawn negotiation). The handshake,
+  identity, mod sync and fan-out are verified by an e2e test with scripted clients;
+  full real-game sessions are the next milestone. The UI labels it EXPERIMENTAL.
+
+## 12. What's Included (completing the original document's cut-off section)
+
+The LAN Edition document ended mid-sentence at "## 📦 What's Included". Here is what a
+BeamMP-LAN release actually ships:
+
+1. **`beammp-lan` (or `beammp-lan.exe`)** — the single native binary:
+   * Servers page — beacon + TCP scan discovery, favorites, manual entries, join
+   * Host page — Relay Mode (offline) + BeamMP-Server instance manager (full compat),
+     one-click BeamMP-Server and CobaltEssentials downloads, live consoles
+   * Mods page — Client/Server mod management for every instance
+   * Launcher page — game detection, BeamMP mod install/update, embedded launcher-core
+   * Settings — identity (nickname + machine ID), roles editor, discovery tuning
+2. **`README.md`** — honest offline-capability matrix, setup, protocol pointers
+3. **`LICENSE`** — AGPL-3.0 (matches BeamMP's own license)
+4. **This plan** — architecture, protocol research, claim→implementation audit
+5. **CI artifacts** (from GitHub Actions): Linux x86_64 + Windows x64 zips, each
+   containing the binary, README and LICENSE
+
+*Not* included (deliberately): no BeamMP-Server binary bundled (downloaded on demand
+from the official repo), no CobaltEssentials bundled (1-click install), no modified
+BeamMP client mod (the stock mod is installed from the official backend), no installer
+(the zip is xcopy-deployable).
+
+## 13. Offline-capability matrix (also in README)
+
+| Capability | Relay Mode | BeamMP-Server instance |
+| --- | --- | --- |
+| Discover servers | ✅ offline (beacon + scan) | ✅ offline (beacon + scan) |
+| Host a session | ✅ offline | ✅ offline (after one-time AuthKey fetch) |
+| Join a session | ✅ offline | ✅ offline (client auth is server-side) |
+| Serve client mods | ✅ offline | ✅ offline |
+| Install BeamMP mod (first time) | ❌ needs internet once | ❌ needs internet once |
+| Full game-session fidelity | ⚠️ experimental | ✅ production |
+
+## 14. v0.2.0 milestone verification
+
+* `cargo test` — 30 tests, including `beacon::tests::e2e_announce_and_seek` (real UDP
+  loopback: announcer → seeker finds it) and `relay::tests::e2e_relay_two_clients`
+  (two scripted clients: handshake, local auth, ids, frame fan-out both directions,
+  stats, events, mod file serving, path-traversal rejection).
+* `cargo clippy --all-targets` — 0 warnings. `cargo fmt` — clean.
+* Windows paths type-checked via `cargo check --target x86_64-pc-windows-msvc`
+  (ureq shimmed out in the sandbox; CI does the real build).
+
+## 15. Licensing
 
 BeamMP-LAN is licensed under **AGPL-3.0-or-later** (same as BeamMP itself). It
-interoperates with BeamMP-Server, BeamMP-Launcher and the BeamMP mod over their documented
-network protocols but does not include their source. BeamMP is © BeamMP Ltd. — this is a
-community LAN tool, not an official BeamMP product.
+interoperates with BeamMP-Server, BeamMP-Launcher and the BeamMP mod over their
+documented network protocols but does not include their source. BeamMP is © BeamMP Ltd.
+— this is a community LAN tool, not an official BeamMP product. CobaltEssentials is ©
+its authors (prestonelam2003 et al.), downloaded on demand from its official releases.

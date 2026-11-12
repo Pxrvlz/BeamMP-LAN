@@ -15,11 +15,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 mod app;
+mod beacon;
 mod discovery;
+mod identity;
 mod launcher;
 mod launcher_core;
 mod mod_manager;
 mod net;
+mod relay;
 mod server_mgr;
 mod state;
 mod theme;

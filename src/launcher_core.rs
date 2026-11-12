@@ -54,10 +54,16 @@ pub struct CoreState {
     pub events: Mutex<Vec<CoreEvent>>,
     /// UI-visible status string ("Ul"-style).
     pub status: Mutex<String>,
+    /// Local identity nickname (reported to the game in the `N` auth reply).
+    pub nickname: String,
 }
 
 impl CoreState {
     pub fn new(data_dir: PathBuf) -> Arc<Self> {
+        // local identity: nickname stored in identity/identity.json
+        let nickname = crate::identity::Identity::load_or_create(&data_dir, "Player")
+            .map(|i| i.nickname)
+            .unwrap_or_else(|_| "Player".into());
         Arc::new(Self {
             running: AtomicBool::new(false),
             public_key: Mutex::new(prefetch_key(&data_dir)),
@@ -66,6 +72,7 @@ impl CoreState {
             data_dir,
             events: Mutex::new(Vec::new()),
             status: Mutex::new("Ulstart".into()),
+            nickname,
         })
     }
 
@@ -229,12 +236,12 @@ fn handle_command(payload: &str, state: &Arc<CoreState>, writer: &mut TcpStream)
         }
         'N' => {
             if rest == "c" {
-                // auto-login check: report guest session if we have a key
+                // auto-login check: report the local identity (nickname + machine id)
                 let authed = state.public_key.lock().unwrap().is_some();
                 let mut j = serde_json::json!({ "Auth": if authed { 1 } else { 0 } });
                 if authed {
-                    j["username"] = serde_json::Value::String("Guest".into());
-                    j["role"] = serde_json::Value::String("guest".into());
+                    j["username"] = serde_json::Value::String(state.nickname.clone());
+                    j["role"] = serde_json::Value::String("player".into());
                 }
                 Some(format!("N{j}"))
             } else if rest == "LO" {
@@ -247,9 +254,10 @@ fn handle_command(payload: &str, state: &Arc<CoreState>, writer: &mut TcpStream)
                 let mut w = writer.try_clone().ok()?;
                 std::thread::spawn(move || {
                     let reply = match st.ensure_key_pub() {
-                        Ok(_) => {
-                            "N{\"Auth\":1,\"username\":\"Guest\",\"role\":\"guest\"}".to_string()
-                        }
+                        Ok(_) => format!(
+                            "N{{\"Auth\":1,\"username\":\"{}\",\"role\":\"player\"}}",
+                            st.nickname
+                        ),
                         Err(e) => {
                             st.log(format!("guest login failed: {e}"));
                             format!("N{{\"Auth\":0,\"message\":\"{e}\"}}")

@@ -48,8 +48,8 @@ impl Default for ServerConfig {
             ip: "::".into(),
             port: crate::net::DEFAULT_SERVER_PORT,
             name: "BeamMP Server".into(),
-            tags: "Freeroam".into(),
-            max_cars: 1,
+            tags: "Freeroam,LAN".into(),
+            max_cars: 4,
             max_players: 8,
             map: "/levels/gridmap_v2/info.json".into(),
             description: "BeamMP Default Description".into(),
@@ -386,11 +386,13 @@ mod tests {
 
     #[test]
     fn config_roundtrip() {
-        let mut cfg = ServerConfig::default();
-        cfg.name = "LAN Party \"Quote\"".to_string();
-        cfg.auth_key = "abcd-1234-efgh-5678".to_string();
-        cfg.port = 30815;
-        cfg.max_players = 16;
+        let cfg = ServerConfig {
+            name: "LAN Party \"Quote\"".to_string(),
+            auth_key: "abcd-1234-efgh-5678".to_string(),
+            port: 30815,
+            max_players: 16,
+            ..Default::default()
+        };
         let s = cfg.to_toml_string();
         assert!(s.contains("[General]"));
         assert!(s.contains("AuthKey = \"abcd-1234-efgh-5678\""));
