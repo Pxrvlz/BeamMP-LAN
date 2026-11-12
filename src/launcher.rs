@@ -99,11 +99,12 @@ fn detect_game_windows() -> Option<GameInstall> {
 
     let game_dir = game_dir?;
     let user_dir = resolve_user_dir(&game_dir, user_override, true)?;
+    let game_version = read_version(&user_dir);
     Some(GameInstall {
         game_dir,
         user_dir,
         method: "registry".into(),
-        game_version: read_version(&user_dir),
+        game_version,
     })
 }
 
