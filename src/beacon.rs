@@ -300,11 +300,13 @@ mod tests {
         assert!(targets.contains(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, BEACON_PORT)));
     }
 
-    /// E2E on loopback: an announcer with a live payload is found by seek().
-    /// Uses the real BEACON_PORT on 127.0.0.1 — must not run concurrently with
-    /// another beacon test.
+    /// E2E: an announcer with a live payload is found by seek().
+    /// Uses the real BEACON_PORT — must not run concurrently with another beacon test.
+    /// The sender's IP is whatever route the OS picks (loopback on a dev box, the
+    /// runner's NIC on CI) — we only assert it's non-empty.
     #[test]
     fn e2e_announce_and_seek() {
+        let _guard = crate::relay::e2e_serial_lock();
         let announcer = Announcer::start();
         announcer.update(sample());
 
@@ -315,11 +317,8 @@ mod tests {
 
         let hit = found
             .iter()
-            .find(|f| f.id == "deadbeef" && f.port == 30814 && f.from_ip == "127.0.0.1");
-        assert!(
-            hit.is_some(),
-            "beacon should be discovered on loopback, got: {found:?}"
-        );
+            .find(|f| f.id == "deadbeef" && f.port == 30814 && !f.from_ip.is_empty());
+        assert!(hit.is_some(), "beacon should be discovered, got: {found:?}");
         assert_eq!(hit.unwrap().name, "Test Host");
         assert_eq!(hit.unwrap().requires, vec!["cars.zip".to_string()]);
     }

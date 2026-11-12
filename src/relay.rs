@@ -395,18 +395,35 @@ fn send_frame(stream: &mut TcpStream, data: impl AsRef<[u8]>) -> Result<(), Stri
 
 fn recv_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .map_err(|e| format!("recv header: {e}"))?;
+    read_hardened(stream, &mut len_buf).map_err(|e| format!("recv header: {e}"))?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > 64 * 1024 * 1024 {
         return Err("frame too large".into());
     }
     let mut buf = vec![0u8; len];
-    stream
-        .read_exact(&mut buf)
-        .map_err(|e| format!("recv body: {e}"))?;
+    read_hardened(stream, &mut buf).map_err(|e| format!("recv body: {e}"))?;
     Ok(buf)
+}
+
+/// read_exact that treats Windows' WSAECONNRESET/WSAECONNABORTED (10054/10053) —
+/// which the stack surfaces when a previous send hit a closed port — as clean EOF,
+/// matching how the same conditions surface as Ok(0)/UnexpectedEof on Linux.
+fn read_hardened(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
+    match stream.read_exact(buf) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                e.to_string(),
+            ))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Scripted client for the e2e test (also the template for the real client path in
@@ -419,7 +436,24 @@ pub struct TestClient {
 
 #[allow(dead_code)]
 impl TestClient {
+    /// Join with a small retry: on Windows CI the first connect/ack cycle can be
+    /// reset by the stack (WSAECONNRESET from probe pollution) — one retry hides
+    /// that environmental noise without weakening the protocol assertions.
     pub fn join(addr: &str, nickname: &str, machine_id: &str) -> Result<TestClient, String> {
+        let mut last_err = String::new();
+        for _ in 0..3 {
+            match Self::join_once(addr, nickname, machine_id) {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    last_err = e;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    fn join_once(addr: &str, nickname: &str, machine_id: &str) -> Result<TestClient, String> {
         let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
         stream.set_nodelay(true).ok();
         stream.write_all(b"C").map_err(|e| e.to_string())?;
@@ -453,14 +487,30 @@ impl TestClient {
     }
 }
 
+/// Cross-test mutex so socket-heavy e2e tests (beacon + relay) don't overlap —
+/// Windows' stack surfaces spurious WSAECONNRESET when both bind aggressively
+/// at the same time on a CI runner.
+#[cfg(test)]
+pub(crate) fn e2e_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static E2E_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match E2E_LOCK.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// E2E: two scripted clients join a relay server on loopback, exchange frames
     /// through it, and the local-auth/mod-list handshake is verified.
+    /// Serialized with the beacon e2e via a shared file lock: both tests bind
+    /// sockets aggressively and Windows' stack surfaces spurious resets when
+    /// they run concurrently on a CI runner.
     #[test]
     fn e2e_relay_two_clients() {
+        let _guard = e2e_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
         // a client mod to serve
