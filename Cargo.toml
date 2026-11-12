@@ -1,0 +1,46 @@
+[package]
+name = "beammp-lan"
+version = "0.1.0"
+edition = "2021"
+description = "All-in-one LAN server manager, mod manager, launcher and server browser for BeamMP"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Pxrvlz/BeamMP-LAN"
+readme = "README.md"
+keywords = ["beammp", "beamng", "lan", "launcher", "server-manager"]
+categories = ["games", "network-programming"]
+
+[dependencies]
+eframe = { version = "0.31", features = ["persistence", "__screenshot"] }
+egui = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+if-addrs = "0.13"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
+open = "5"
+
+# HTTP client: rustls to avoid system openssl churn on Windows hosts
+ureq = { version = "2", features = ["json", "tls"] }
+
+# zip handling for mod/server installs
+zip = "2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "beammp-lan"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+
+[profile.dev]
+opt-level = 1

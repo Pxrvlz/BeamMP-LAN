@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: beammp-lan-linux-amd64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: beammp-lan-windows-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Release build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package artifact (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/beammp-lan dist/${{ matrix.artifact }}/
+          cp README.md LICENSE dist/${{ matrix.artifact }}/
+          cd dist && zip -r ${{ matrix.artifact }}.zip ${{ matrix.artifact }}
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact }}
+          Copy-Item target/${{ matrix.target }}/release/beammp-lan.exe dist/${{ matrix.artifact }}/
+          Copy-Item README.md,LICENSE dist/${{ matrix.artifact }}/
+          Compress-Archive -Path dist/${{ matrix.artifact }} -DestinationPath dist/${{ matrix.artifact }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.zip
