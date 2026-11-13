@@ -101,7 +101,7 @@ pub fn pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Respon
         .fill(color.gamma_multiply(0.14))
         .stroke(egui::Stroke::new(1.0f32, color.gamma_multiply(0.7)))
         .corner_radius(4)
-        .inner_margin(egui::Margin::symmetric(8, 2));
+        .inner_margin(egui::Margin::symmetric(10, 3));
     frame.show(ui, |ui| ui.label(rich)).inner
 }
 
@@ -142,12 +142,17 @@ pub fn danger_button(ui: &mut egui::Ui, label: &str) -> bool {
 
 /// BeamNG-style card frame.
 pub fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    // Full-width card: stretch the inner region to the available width so all cards
+    // align (a bare Frame sizes to its content, giving ragged right edges).
     egui::Frame::new()
         .fill(PANEL)
         .stroke(egui::Stroke::new(1.0f32, BORDER))
         .corner_radius(8)
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, add_contents);
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add_contents(ui);
+        });
 }
 
 /// Pretty-print a BeamMP map path like `/levels/gridmap_v2/info.json` → `Gridmap V2`.

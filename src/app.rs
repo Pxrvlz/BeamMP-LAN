@@ -196,7 +196,13 @@ impl eframe::App for BeamMpLanApp {
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
-                    .stroke(egui::Stroke::new(1.0f32, BORDER)),
+                    .stroke(egui::Stroke::new(1.0f32, BORDER))
+                    .inner_margin(egui::Margin {
+                        left: 10,
+                        right: 8,
+                        top: 8,
+                        bottom: 10,
+                    }),
             )
             .exact_width(190.0)
             .show(ctx, |ui| {
@@ -209,12 +215,18 @@ impl eframe::App for BeamMpLanApp {
                     .fill(BG)
                     .inner_margin(egui::Margin::same(16)),
             )
-            .show(ctx, |ui| match self.state.page {
-                Page::Servers => self.page_servers(ui),
-                Page::Host => self.page_host(ui),
-                Page::Mods => self.page_mods(ui),
-                Page::Launcher => self.page_launcher(ui),
-                Page::Settings => self.page_settings(ui),
+            .show(ctx, |ui| {
+                // Pages can be taller than the window (Settings grew in v0.2.0) —
+                // vertical scrolling instead of clipping the bottom cards.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.state.page {
+                        Page::Servers => self.page_servers(ui),
+                        Page::Host => self.page_host(ui),
+                        Page::Mods => self.page_mods(ui),
+                        Page::Launcher => self.page_launcher(ui),
+                        Page::Settings => self.page_settings(ui),
+                    });
             });
 
         self.toasts(ctx);
@@ -241,7 +253,12 @@ impl BeamMpLanApp {
             .stroke(egui::Stroke::new(1.0f32, BORDER))
             .inner_margin(egui::Margin::symmetric(16, 8))
             .show(ui, |ui| {
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                // Single row: title (left) + status pills (right). The right-aligned
+                // region is nested LAST inside the horizontal row so it takes the
+                // remaining WIDTH — two stacked `with_layout` regions would each
+                // consume all remaining HEIGHT, squashing the pills to slivers and
+                // blowing up the panel (verified via egui geometry repro).
+                ui.horizontal(|ui| {
                     ui.label(RichText::new("BEAMMP").color(ACCENT).strong().size(20.0));
                     ui.label(RichText::new("-LAN").color(TEXT).strong().size(20.0));
                     ui.add_space(16.0);
@@ -254,36 +271,36 @@ impl BeamMpLanApp {
                         .color(TEXT_DIM)
                         .small(),
                     );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.state.core_running {
-                        pill(ui, "LAUNCHER CORE ONLINE", GREEN);
-                    } else {
-                        pill(ui, "LAUNCHER CORE OFFLINE", RED);
-                    }
-                    ui.add_space(8.0);
-                    if self.state.relay.is_some() {
-                        pill(ui, "RELAY MODE ON", ACCENT);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.state.core_running {
+                            pill(ui, "LAUNCHER CORE ONLINE", GREEN);
+                        } else {
+                            pill(ui, "LAUNCHER CORE OFFLINE", RED);
+                        }
                         ui.add_space(8.0);
-                    }
-                    if self.state.scanning || self.state.beacon_scanning {
-                        pill(ui, "SCANNING…", WARN);
-                    } else {
-                        let n = self.state.all_servers().len();
-                        pill(
-                            ui,
-                            &format!(
-                                "{n} SERVER{} FOUND{}",
-                                if n == 1 { "" } else { "S" },
-                                if self.state.beacons.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" · {} VIA BEACON", self.state.beacons.len())
-                                }
-                            ),
-                            SELECTION,
-                        );
-                    }
+                        if self.state.relay.is_some() {
+                            pill(ui, "RELAY MODE ON", ACCENT);
+                            ui.add_space(8.0);
+                        }
+                        if self.state.scanning || self.state.beacon_scanning {
+                            pill(ui, "SCANNING…", WARN);
+                        } else {
+                            let n = self.state.all_servers().len();
+                            pill(
+                                ui,
+                                &format!(
+                                    "{n} SERVER{} FOUND{}",
+                                    if n == 1 { "" } else { "S" },
+                                    if self.state.beacons.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" · {} VIA BEACON", self.state.beacons.len())
+                                    }
+                                ),
+                                SELECTION,
+                            );
+                        }
+                    });
                 });
             });
     }
@@ -332,20 +349,21 @@ impl BeamMpLanApp {
                     self.state.page = page;
                 }
             }
+        });
 
-            ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("LAN edition · AGPL-3.0")
-                        .color(TEXT_DIM)
-                        .small(),
-                );
-                ui.label(
-                    RichText::new(format!("core v{}", crate::launcher_core::CORE_VERSION))
-                        .color(TEXT_DIM)
-                        .small(),
-                );
-            });
+        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+            ui.label(
+                RichText::new(format!("core v{}", crate::launcher_core::CORE_VERSION))
+                    .color(TEXT_DIM)
+                    .small(),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("LAN edition · AGPL-3.0")
+                    .color(TEXT_DIM)
+                    .small(),
+            );
+            ui.add_space(6.0); // panel frame inner_margin adds the final bottom padding
         });
     }
 
@@ -771,15 +789,17 @@ impl BeamMpLanApp {
                     } else if action_button(ui, "START RELAY") {
                         self.state.start_relay(idx);
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ghost_button(ui, "ANNOUNCE VIA BEACON") {
+                            self.state.start_announcer();
+                        }
+                    });
                 } else {
                     ui.label(
                         RichText::new("Create an instance first (it holds the map/mods config).")
                             .color(TEXT_DIM)
                             .small(),
                     );
-                }
-                if ghost_button(ui, "ANNOUNCE VIA BEACON") {
-                    self.state.start_announcer();
                 }
             });
             if !self.state.relay_events.is_empty() {
@@ -1639,9 +1659,10 @@ impl BeamMpLanApp {
                         self.state.toast("Nickname saved".to_string());
                     }
                 }
+                ui.add_space(12.0);
                 ui.label(
                     RichText::new(format!(
-                        "machine ID {}…",
+                        "machine ID: {}…",
                         &self.state.identity.machine_id[..8]
                     ))
                     .color(TEXT_DIM)
@@ -1861,6 +1882,9 @@ impl BeamMpLanApp {
             self.state.push_server_list_to_core();
             self.state.toast("Settings saved".to_string());
         }
+        // Breathing room below the last element so scrolled content doesn't end
+        // flush against the window edge.
+        ui.add_space(16.0);
     }
 
     /// Download CobaltEssentials (community BeamMP server plugin: admin commands,
